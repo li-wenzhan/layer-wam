@@ -226,6 +226,7 @@ report.xml
 
 # CI-CD
 temp/
+tmp/
 envs.txt
 manifest.json
 
