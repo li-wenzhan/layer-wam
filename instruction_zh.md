@@ -444,7 +444,36 @@ pip install -e .
 python -m unittest tests.test_visibility_mask
 ```
 
-### 12.5 4 张 H100 显存不够怎么办？
+### 12.5 预计算文本 embedding 报 `huggingface-hub` 版本错误怎么办？
+
+如果看到类似错误：
+
+```text
+ImportError: huggingface-hub>=0.26.0,<1.0 is required ... found huggingface-hub==1.18.0
+```
+
+说明当前环境中的 `huggingface-hub` 版本和 `transformers==4.49.0` 不兼容。请在当前仓库根目录执行：
+
+```bash
+conda activate fastwam
+python -m pip install "huggingface-hub==0.29.2"
+python -m pip install -e .
+```
+
+同时建议确认导入的是当前仓库，而不是旧的 FastWAM editable install：
+
+```bash
+python - <<'PY'
+import fastwam
+import huggingface_hub
+print(fastwam.__file__)
+print(huggingface_hub.__version__)
+PY
+```
+
+`fastwam.__file__` 应该指向当前 `layer-wam/src/fastwam`。
+
+### 12.6 4 张 H100 显存不够怎么办？
 
 优先尝试：
 
@@ -465,4 +494,3 @@ bash scripts/train_zero2.sh 4 \
   gradient_accumulation_steps=2 \
   model.mot_checkpoint_mixed_attn=true
 ```
-

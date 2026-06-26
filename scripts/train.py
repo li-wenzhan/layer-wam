@@ -1,3 +1,7 @@
+from _repo_bootstrap import bootstrap_repo_src
+
+bootstrap_repo_src()
+
 import hydra
 from omegaconf import DictConfig
 

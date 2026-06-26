@@ -2,6 +2,11 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+from _repo_bootstrap import assert_huggingface_hub_compatible, bootstrap_repo_src
+
+bootstrap_repo_src()
+assert_huggingface_hub_compatible()
+
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
