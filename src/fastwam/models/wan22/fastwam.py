@@ -389,7 +389,9 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        video_grid_size: Optional[tuple[int, int, int]] = None,
     ) -> torch.Tensor:
+        del video_grid_size
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
 
@@ -405,6 +407,19 @@ class FastWAM(torch.nn.Module):
         first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
         mask[video_seq_len:, :first_frame_tokens] = True
         return mask
+
+    @staticmethod
+    def _video_self_mask_from_joint_mask(
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        if attention_mask.ndim == 2:
+            return attention_mask[:video_seq_len, :video_seq_len]
+        if attention_mask.ndim == 3:
+            return attention_mask[0, :video_seq_len, :video_seq_len]
+        raise ValueError(
+            f"`attention_mask` must be 2D [S,S] or 3D [L,S,S], got shape {tuple(attention_mask.shape)}"
+        )
 
     def _compute_video_loss_per_sample(
         self,
@@ -500,6 +515,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
+            video_grid_size=video_pre["meta"].get("grid_size"),
         )
         tokens_out = self.mot(
             embeds_all={
@@ -599,6 +615,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            video_grid_size=video_pre["meta"].get("grid_size"),
         )
 
         tokens_out = self.mot(
@@ -662,6 +679,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            video_grid_size=video_pre["meta"].get("grid_size"),
         )
         tokens_out = self.mot(
             embeds_all={
@@ -1009,6 +1027,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            video_grid_size=video_pre["meta"].get("grid_size"),
         )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],
@@ -1018,7 +1037,7 @@ class FastWAM(torch.nn.Module):
                 "context": video_pre["context"],
                 "mask": video_pre["context_mask"],
             },
-            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
+            video_attention_mask=self._video_self_mask_from_joint_mask(attention_mask, video_seq_len),
         )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(

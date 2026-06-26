@@ -373,6 +373,13 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
+    @staticmethod
+    def _filter_call_kwargs(fn, kwargs: dict) -> dict:
+        signature = inspect.signature(fn)
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+            return dict(kwargs)
+        return {key: value for key, value in kwargs.items() if key in signature.parameters}
+
     @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
@@ -399,34 +406,54 @@ class Wan22Trainer:
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 
-        # 2. inference and video saving
-        infer_kwargs = {
+        # 2. action-only inference for primary action metrics
+        common_infer_kwargs = {
+            "prompt": prompt,
             "input_image": input_image,
-            "num_frames": num_frames,
-            "action": action,
             "action_horizon": sample['action_horizon'],
+            "num_video_frames": num_frames,
             "proprio": proprio,
+            "negative_prompt": None,
             "text_cfg_scale": 1.0,
-            "action_cfg_scale": 1.0,
             "num_inference_steps": self.eval_num_inference_steps,
+            "sigma_shift": None,
             "seed": 42,
+            "rand_device": "cpu",
             "tiled": False,
         }
         if sample["context"] is not None:
-            infer_kwargs["prompt"] = None
-            infer_kwargs["context"] = sample["context"][0]
-            infer_kwargs["context_mask"] = sample["context_mask"][0]
-        else:
-            infer_kwargs["prompt"] = prompt
+            common_infer_kwargs["prompt"] = None
+            common_infer_kwargs["context"] = sample["context"][0]
+            common_infer_kwargs["context_mask"] = sample["context_mask"][0]
 
-        pred = model.infer(
-            **infer_kwargs,
-        )
+        action_only_pred = None
+        if sample["action_horizon"] is not None and hasattr(model, "infer_action"):
+            action_only_out = model.infer_action(
+                **self._filter_call_kwargs(model.infer_action, common_infer_kwargs)
+            )
+            action_only_pred = action_only_out.get("action", None)
+
+        # 3. joint rollout is only a video diagnostic path.
+        joint_infer_kwargs = dict(common_infer_kwargs)
+        joint_infer_kwargs["action"] = action
+        joint_infer_kwargs["test_action_with_infer_action"] = False
+        if hasattr(model, "infer_joint"):
+            pred = model.infer_joint(
+                **self._filter_call_kwargs(model.infer_joint, joint_infer_kwargs)
+            )
+        else:
+            fallback_kwargs = dict(common_infer_kwargs)
+            fallback_kwargs["num_frames"] = num_frames
+            fallback_kwargs["action"] = action
+            fallback_kwargs["action_cfg_scale"] = 1.0
+            pred = model.infer(
+                **self._filter_call_kwargs(model.infer, fallback_kwargs)
+            )
         
         pred_video = pred["video"]
-        pred_action = pred.get("action", None)
+        joint_pred_action = pred.get("action", None)
 
-        # 3. inference metrics against GT video
+        # 4. video rollout metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
         gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
 
@@ -438,9 +465,14 @@ class Wan22Trainer:
         psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
         ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
 
-        action_l1 = None
-        action_l2 = None
-        if action is not None and pred_action is not None:
+        action_only_l1 = None
+        action_only_l2 = None
+        joint_action_l1_diagnostic = None
+        joint_action_l2_diagnostic = None
+
+        def compute_action_metrics(pred_action, gt_action):
+            if pred_action is None or gt_action is None:
+                return None
             if sample["proprio"] is None:
                 raise ValueError("Eval sample must contain `proprio` for action denormalization.")
             proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
@@ -450,7 +482,7 @@ class Wan22Trainer:
             denorm_actions = {}
             action_meta = processor.shape_meta["action"]
             state_meta = processor.shape_meta["state"]
-            for action_name, raw_action in (("pred", pred_action), ("gt", action)):
+            for action_name, raw_action in (("pred", pred_action), ("gt", gt_action)):
                 if not isinstance(raw_action, torch.Tensor):
                     raise TypeError(f"{action_name} action must be a torch.Tensor, got {type(raw_action)}")
                 if raw_action.ndim == 2:
@@ -490,10 +522,17 @@ class Wan22Trainer:
                     f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
                 )
             action_diff = pred_action_denorm - gt_action_denorm
-            action_l1 = action_diff.abs().mean().item()
-            action_l2 = action_diff.pow(2).mean().item()
+            return action_diff.abs().mean().item(), action_diff.pow(2).mean().item()
 
-        # 4. VAE reconstruction metrics against GT video
+        action_only_metrics = compute_action_metrics(action_only_pred, action)
+        if action_only_metrics is not None:
+            action_only_l1, action_only_l2 = action_only_metrics
+
+        joint_action_metrics = compute_action_metrics(joint_pred_action, action)
+        if joint_action_metrics is not None:
+            joint_action_l1_diagnostic, joint_action_l2_diagnostic = joint_action_metrics
+
+        # 5. VAE reconstruction metrics against GT video
         gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
         vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
         vae_recon_video = model._decode_latents(vae_latents, tiled=False)
@@ -534,16 +573,24 @@ class Wan22Trainer:
                 float(ssim_rollout_vs_decode),
                 float(psnr_decode_vs_gt),
                 float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
+                float(action_only_l2) if action_only_l2 is not None else -1.0,
+                float(action_only_l1) if action_only_l1 is not None else -1.0,
+                float(joint_action_l2_diagnostic) if joint_action_l2_diagnostic is not None else -1.0,
+                float(joint_action_l1_diagnostic) if joint_action_l1_diagnostic is not None else -1.0,
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
         ).unsqueeze(0)
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        action_only_l2_mean = gathered_metrics[:, 7].mean().item() if action_only_l2 is not None else None
+        action_only_l1_mean = gathered_metrics[:, 8].mean().item() if action_only_l1 is not None else None
+        joint_action_l2_mean = (
+            gathered_metrics[:, 9].mean().item() if joint_action_l2_diagnostic is not None else None
+        )
+        joint_action_l1_mean = (
+            gathered_metrics[:, 10].mean().item() if joint_action_l1_diagnostic is not None else None
+        )
 
         if was_dit_training:
             self._set_dit_only_train_mode()
@@ -556,12 +603,19 @@ class Wan22Trainer:
             "ssim_rd": float(mean_metrics[4].item()),
             "psnr_dg": float(mean_metrics[5].item()),
             "ssim_dg": float(mean_metrics[6].item()),
+            "video_rollout_psnr": float(mean_metrics[1].item()),
+            "video_rollout_ssim": float(mean_metrics[2].item()),
             "video_path": video_path,
+            "future_visualization": video_path,
         }
-        if action_l2_mean is not None:
-            result["action_l2"] = float(action_l2_mean)
-        if action_l1_mean is not None:
-            result["action_l1"] = float(action_l1_mean)
+        if action_only_l2_mean is not None:
+            result["action_only_l2"] = float(action_only_l2_mean)
+        if action_only_l1_mean is not None:
+            result["action_only_l1"] = float(action_only_l1_mean)
+        if joint_action_l2_mean is not None:
+            result["joint_action_l2_diagnostic"] = float(joint_action_l2_mean)
+        if joint_action_l1_mean is not None:
+            result["joint_action_l1_diagnostic"] = float(joint_action_l1_mean)
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -739,10 +793,10 @@ class Wan22Trainer:
                                 metrics["psnr_rd"],
                                 metrics["ssim_rd"],
                             )
-                            if "action_l2" in metrics:
-                                description += " action_l2=%.4f" % metrics["action_l2"]
-                            if "action_l1" in metrics:
-                                description += " action_l1=%.4f" % metrics["action_l1"]
+                            if "action_only_l2" in metrics:
+                                description += " action_only_l2=%.4f" % metrics["action_only_l2"]
+                            if "action_only_l1" in metrics:
+                                description += " action_only_l1=%.4f" % metrics["action_only_l1"]
                             logger.info(description)
                             eval_payload = {
                                 "eval/val_loss": float(metrics["val_loss"]),
@@ -753,10 +807,18 @@ class Wan22Trainer:
                                 "eval/psnr_dg": float(metrics["psnr_dg"]),
                                 "eval/ssim_dg": float(metrics["ssim_dg"]),
                             }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            if "action_only_l2" in metrics:
+                                eval_payload["eval/action_only_l2"] = float(metrics["action_only_l2"])
+                            if "action_only_l1" in metrics:
+                                eval_payload["eval/action_only_l1"] = float(metrics["action_only_l1"])
+                            if "joint_action_l2_diagnostic" in metrics:
+                                eval_payload["eval/joint_action_l2_diagnostic"] = float(
+                                    metrics["joint_action_l2_diagnostic"]
+                                )
+                            if "joint_action_l1_diagnostic" in metrics:
+                                eval_payload["eval/joint_action_l1_diagnostic"] = float(
+                                    metrics["joint_action_l1_diagnostic"]
+                                )
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

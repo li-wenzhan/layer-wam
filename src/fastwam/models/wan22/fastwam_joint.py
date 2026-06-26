@@ -32,7 +32,9 @@ class FastWAMJoint(FastWAM):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        video_grid_size: Optional[tuple[int, int, int]] = None,
     ) -> torch.Tensor:
+        del video_grid_size
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
 
