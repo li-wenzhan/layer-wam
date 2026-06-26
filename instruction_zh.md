@@ -287,7 +287,93 @@ bash scripts/run_clcf_ablation.sh \
 
 注意：`RUN_ID_PREFIX` 建议每轮实验设为不同值，避免输出目录名冲突。
 
-## 9. Validation 指标解释
+## 9. ACP 集群任务入口
+
+如果实验通过 ACP 提交，推荐使用：
+
+```text
+scripts/acp_clcf_wam.sh
+```
+
+该脚本是 ACP job 内部执行的入口脚本，流程包括：
+
+```text
+清理残留进程 / 注入路径式 conda 环境 / 设置缓存与离线变量 / 设置 CUDA-NCCL / 执行实验命令 / 保存日志 / 扫描错误并返回 exit code
+```
+
+首次使用前，请打开脚本顶部的 `TODO` 区域，至少修改：
+
+```text
+PROJECT_DIR
+CONDA_ENV_DIR
+DIFFSYNTH_MODEL_BASE_PATH
+CACHE_ROOT
+LOG_ROOT
+CUDA_VISIBLE_DEVICES
+NPROC_PER_NODE
+TASK_NAME
+```
+
+训练单个 CLCF mode：
+
+```bash
+RUN_KIND=train \
+PROJECT_DIR=/mnt/afs/TODO_USER/TODO_PROJECT/layer-wam \
+CONDA_ENV_DIR=/mnt/afs/TODO_USER/envs/fastwam \
+DIFFSYNTH_MODEL_BASE_PATH=/mnt/afs/TODO_USER/checkpoints \
+CACHE_ROOT=/mnt/afs/TODO_USER/cache \
+LOG_ROOT=/mnt/afs/TODO_USER/tmp/layer-wam/acp_logs \
+VISIBILITY_MODE=clcf \
+TASK_NAME=libero_uncond_2cam224_1e-4 \
+bash scripts/acp_clcf_wam.sh
+```
+
+预计算文本 embedding：
+
+```bash
+RUN_KIND=precompute_text \
+PROJECT_DIR=/mnt/afs/TODO_USER/TODO_PROJECT/layer-wam \
+CONDA_ENV_DIR=/mnt/afs/TODO_USER/envs/fastwam \
+DIFFSYNTH_MODEL_BASE_PATH=/mnt/afs/TODO_USER/checkpoints \
+CACHE_ROOT=/mnt/afs/TODO_USER/cache \
+LOG_ROOT=/mnt/afs/TODO_USER/tmp/layer-wam/acp_logs \
+TASK_NAME=libero_uncond_2cam224_1e-4 \
+bash scripts/acp_clcf_wam.sh
+```
+
+跑完整 ablation：
+
+```bash
+RUN_KIND=ablation \
+PROJECT_DIR=/mnt/afs/TODO_USER/TODO_PROJECT/layer-wam \
+CONDA_ENV_DIR=/mnt/afs/TODO_USER/envs/fastwam \
+DIFFSYNTH_MODEL_BASE_PATH=/mnt/afs/TODO_USER/checkpoints \
+CACHE_ROOT=/mnt/afs/TODO_USER/cache \
+LOG_ROOT=/mnt/afs/TODO_USER/tmp/layer-wam/acp_logs \
+TASK_NAME=libero_uncond_2cam224_1e-4 \
+RUN_ID_PREFIX=libero_clcf_v1 \
+bash scripts/acp_clcf_wam.sh
+```
+
+评估 LIBERO checkpoint：
+
+```bash
+RUN_KIND=eval_libero \
+USE_XVFB=true \
+PROJECT_DIR=/mnt/afs/TODO_USER/TODO_PROJECT/layer-wam \
+CONDA_ENV_DIR=/mnt/afs/TODO_USER/envs/fastwam \
+DIFFSYNTH_MODEL_BASE_PATH=/mnt/afs/TODO_USER/checkpoints \
+CACHE_ROOT=/mnt/afs/TODO_USER/cache \
+LOG_ROOT=/mnt/afs/TODO_USER/tmp/layer-wam/acp_logs \
+TASK_NAME=libero_uncond_2cam224_1e-4 \
+CKPT_PATH=/mnt/afs/TODO_USER/TODO_RUN/checkpoints/weights/TODO_STEP.pt \
+DATASET_STATS_PATH=/mnt/afs/TODO_USER/TODO_RUN/dataset_stats.json \
+bash scripts/acp_clcf_wam.sh
+```
+
+脚本中的 `TODO` 占位符如果没有替换，会在任务开始时直接报错退出，避免 ACP 任务跑到一半才发现路径不对。
+
+## 10. Validation 指标解释
 
 本仓库已将训练期 validation 拆成两条路径：
 
@@ -323,7 +409,7 @@ eval/joint_action_l2_diagnostic
 
 论文主表或成功率统计应优先使用 `infer_action()` 对应的 action-only 路径，不要把 joint rollout 的 action 当成主 action 指标。
 
-## 10. 评估训练好的 Checkpoint
+## 11. 评估训练好的 Checkpoint
 
 LIBERO：
 
@@ -355,7 +441,7 @@ python experiments/robotwin/run_robotwin_manager.py \
   MULTIRUN.num_gpus=4
 ```
 
-## 11. 推荐实验顺序
+## 12. 推荐实验顺序
 
 建议第一轮按以下顺序运行：
 
@@ -393,9 +479,9 @@ clcf vs clcf_wo_spatial_c2f:
   验证 P1 spatial coarse-to-fine sparse anchors
 ```
 
-## 12. 常见问题
+## 13. 常见问题
 
-### 12.1 为什么 CLCF 的时间对齐不是 `action_video_freq_ratio=4`？
+### 13.1 为什么 CLCF 的时间对齐不是 `action_video_freq_ratio=4`？
 
 CLCF mask 工作在 MoT latent token 层级。当前数据流是：
 
@@ -420,7 +506,7 @@ a0-a15  -> future latent frame 1
 a16-a31 -> future latent frame 2
 ```
 
-### 12.2 CLCF 是否实现严格因果信息隔离？
+### 13.2 CLCF 是否实现严格因果信息隔离？
 
 不是。本项目第一版只控制：
 
@@ -430,11 +516,11 @@ direct action-to-future-video visibility
 
 即 action query 直接读取哪些 future video key。它是 direct-edge causal / local，不是 strict causal information flow。我们不修改 video-to-video mask。
 
-### 12.3 `infer_action()` 中为什么没有 future video？
+### 13.3 `infer_action()` 中为什么没有 future video？
 
 这是 Fast-WAM 的核心推理路径：推理时只给 current image / first-frame latent，直接 denoise action，不显式生成 future video。对于 CLCF-WAM，只有 first-frame latent 时，3D visibility mask 会自动退化为 base no-future mask。
 
-### 12.4 跑单元测试报 `ModuleNotFoundError: No module named 'torch'` 怎么办？
+### 13.4 跑单元测试报 `ModuleNotFoundError: No module named 'torch'` 怎么办？
 
 说明当前 Python 环境不是项目环境。请先：
 
@@ -444,7 +530,7 @@ pip install -e .
 python -m unittest tests.test_visibility_mask
 ```
 
-### 12.5 预计算文本 embedding 报 `huggingface-hub` 版本错误怎么办？
+### 13.5 预计算文本 embedding 报 `huggingface-hub` 版本错误怎么办？
 
 如果看到类似错误：
 
@@ -473,7 +559,7 @@ PY
 
 `fastwam.__file__` 应该指向当前 `layer-wam/src/fastwam`。
 
-### 12.6 4 张 H100 显存不够怎么办？
+### 13.6 4 张 H100 显存不够怎么办？
 
 优先尝试：
 
