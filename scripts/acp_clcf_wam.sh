@@ -310,7 +310,7 @@ case "${RUN_KIND}" in
     CMD=(
       python scripts/precompute_text_embeds.py
       "task=${TASK_NAME}"
-      "overwrite=${OVERWRITE_TEXT_CACHE}"
+      "+overwrite=${OVERWRITE_TEXT_CACHE}"
       "${EXTRA_ARGS[@]}"
     )
     ;;
