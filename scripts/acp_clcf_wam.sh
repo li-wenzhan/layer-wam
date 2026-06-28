@@ -192,10 +192,25 @@ VISIBILITY_MODE="${VISIBILITY_MODE:-fastwam}"
 #   scheduled variants -> 0.3
 FUTURE_MASK_DROPOUT="${FUTURE_MASK_DROPOUT:-auto}"
 
-# TODO: Tune if 4 * H100 is not enough or if a different global batch is desired.
-BATCH_SIZE="${BATCH_SIZE:-16}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-MOT_CHECKPOINT_MIXED_ATTN="${MOT_CHECKPOINT_MIXED_ATTN:-false}"
+# TODO: Training memory knobs.
+# Important: `batch_size` in FastWAM's Trainer is per GPU, not global.
+# The default below keeps an effective global batch of 16 while using a small
+# per-GPU micro batch that fits 80GB H100 more reliably.
+#
+# Recommended 4 * H100 examples:
+#   LIBERO:   TARGET_GLOBAL_BATCH_SIZE=16 PER_DEVICE_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=2
+#   RoboTwin: TARGET_GLOBAL_BATCH_SIZE=16 PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACCUMULATION_STEPS=4
+#
+# Recommended 2 * H100 examples:
+#   LIBERO:   TARGET_GLOBAL_BATCH_SIZE=16 PER_DEVICE_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=4
+#   RoboTwin: TARGET_GLOBAL_BATCH_SIZE=16 PER_DEVICE_BATCH_SIZE=1 GRADIENT_ACCUMULATION_STEPS=8
+TARGET_GLOBAL_BATCH_SIZE="${TARGET_GLOBAL_BATCH_SIZE:-16}"
+PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-${BATCH_SIZE:-auto}}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-auto}"
+
+# Keep this true for training unless you are doing an explicit memory ablation.
+# It enables checkpointing in the mixed video/action MoT attention path.
+MOT_CHECKPOINT_MIXED_ATTN="${MOT_CHECKPOINT_MIXED_ATTN:-true}"
 
 # Optional Hydra overrides. Keep this simple: space-separated key=value entries.
 # TODO: Add project-specific overrides here if needed.
@@ -256,6 +271,16 @@ resolve_dropout() {
   fi
 }
 
+is_positive_integer() {
+  [[ "${1}" =~ ^[1-9][0-9]*$ ]]
+}
+
+ceil_div() {
+  local numerator="$1"
+  local denominator="$2"
+  echo $(( (numerator + denominator - 1) / denominator ))
+}
+
 parse_extra_args() {
   EXTRA_ARGS=()
   if [[ -n "${HYDRA_EXTRA_ARGS}" ]]; then
@@ -270,6 +295,47 @@ task_family() {
     robotwin_*) echo "robotwin" ;;
     *) echo "unknown" ;;
   esac
+}
+
+default_per_device_batch_size() {
+  case "$(task_family)" in
+    robotwin) echo "1" ;;
+    *) echo "2" ;;
+  esac
+}
+
+resolve_training_batching() {
+  if ! is_positive_integer "${NPROC_PER_NODE}"; then
+    echo "ERROR: NPROC_PER_NODE must be a positive integer, got ${NPROC_PER_NODE}"
+    return 1
+  fi
+
+  if [[ "${PER_DEVICE_BATCH_SIZE}" == "auto" ]]; then
+    RESOLVED_BATCH_SIZE="$(default_per_device_batch_size)"
+  else
+    if ! is_positive_integer "${PER_DEVICE_BATCH_SIZE}"; then
+      echo "ERROR: PER_DEVICE_BATCH_SIZE/BATCH_SIZE must be a positive integer or auto, got ${PER_DEVICE_BATCH_SIZE}"
+      return 1
+    fi
+    RESOLVED_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE}"
+  fi
+
+  if [[ "${GRADIENT_ACCUMULATION_STEPS}" == "auto" ]]; then
+    if ! is_positive_integer "${TARGET_GLOBAL_BATCH_SIZE}"; then
+      echo "ERROR: TARGET_GLOBAL_BATCH_SIZE must be a positive integer, got ${TARGET_GLOBAL_BATCH_SIZE}"
+      return 1
+    fi
+    local micro_global=$(( RESOLVED_BATCH_SIZE * NPROC_PER_NODE ))
+    RESOLVED_GRADIENT_ACCUMULATION_STEPS="$(ceil_div "${TARGET_GLOBAL_BATCH_SIZE}" "${micro_global}")"
+  else
+    if ! is_positive_integer "${GRADIENT_ACCUMULATION_STEPS}"; then
+      echo "ERROR: GRADIENT_ACCUMULATION_STEPS must be a positive integer or auto, got ${GRADIENT_ACCUMULATION_STEPS}"
+      return 1
+    fi
+    RESOLVED_GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS}"
+  fi
+
+  RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=$(( RESOLVED_BATCH_SIZE * NPROC_PER_NODE * RESOLVED_GRADIENT_ACCUMULATION_STEPS ))
 }
 
 validate_lerobot_dir() {
@@ -448,6 +514,7 @@ export TORCH_HOME="${CACHE_ROOT}/torch"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${JOB_LOCAL_CACHE_ROOT}/triton}"
 export CLCF_PER_RANK_DATASETS_CACHE
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export HF_DATASETS_OFFLINE="${HF_OFFLINE}"
 export TRANSFORMERS_OFFLINE="${HF_OFFLINE}"
@@ -496,6 +563,22 @@ if [[ "${#DATA_ARGS[@]}" -gt 0 ]]; then
   printf '%q\n' "${DATA_ARGS[@]}"
 fi
 
+RESOLVED_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE}"
+RESOLVED_GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS}"
+RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=""
+case "${RUN_KIND}" in
+  train|ablation)
+    resolve_training_batching || exit 2
+    echo "========== TRAINING BATCHING =========="
+    echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
+    echo "PER_DEVICE_BATCH_SIZE=${RESOLVED_BATCH_SIZE}"
+    echo "GRADIENT_ACCUMULATION_STEPS=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
+    echo "EFFECTIVE_GLOBAL_BATCH_SIZE=${RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE}"
+    echo "MOT_CHECKPOINT_MIXED_ATTN=${MOT_CHECKPOINT_MIXED_ATTN}"
+    echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+    ;;
+esac
+
 # ==========================================
 # 5. Build command
 # ==========================================
@@ -525,8 +608,8 @@ case "${RUN_KIND}" in
       bash scripts/train_zero2.sh "${NPROC_PER_NODE}"
       "task=${TASK_NAME}"
       "model=${MODEL_CONFIG}"
-      "batch_size=${BATCH_SIZE}"
-      "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
+      "batch_size=${RESOLVED_BATCH_SIZE}"
+      "gradient_accumulation_steps=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
       "wandb.name=${MODEL_CONFIG}_${VISIBILITY_MODE}"
       "${DATA_ARGS[@]}"
@@ -547,8 +630,8 @@ case "${RUN_KIND}" in
     CMD=(
       bash scripts/run_clcf_ablation.sh
       "task=${TASK_NAME}"
-      "batch_size=${BATCH_SIZE}"
-      "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
+      "batch_size=${RESOLVED_BATCH_SIZE}"
+      "gradient_accumulation_steps=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
       "${DATA_ARGS[@]}"
       "${EXTRA_ARGS[@]}"
