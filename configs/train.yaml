@@ -29,6 +29,8 @@ mixed_precision: "bf16" # one of: [no, fp16, bf16]
 seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
+optimizer_foreach: false
+optimizer_fused: false
 resume: null
 
 # wandb

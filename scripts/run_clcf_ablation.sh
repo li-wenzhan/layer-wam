@@ -2,6 +2,7 @@
 set -euo pipefail
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+TRAIN_LAUNCH_SCRIPT="${TRAIN_LAUNCH_SCRIPT:-scripts/train_zero2.sh}"
 TASK_OVERRIDE="${TASK_OVERRIDE:-task=libero_uncond_2cam224_1e-4}"
 if (($# > 0)) && [[ "$1" == task=* ]]; then
   TASK_OVERRIDE="$1"
@@ -27,7 +28,7 @@ for mode in "${MODES[@]}"; do
   fi
 
   RUN_ID="${RUN_ID_PREFIX:-clcf}_${mode}" \
-  bash scripts/train_zero2.sh "${NPROC_PER_NODE}" \
+  bash "${TRAIN_LAUNCH_SCRIPT}" "${NPROC_PER_NODE}" \
     "${TASK_OVERRIDE}" \
     "model=fastwam_3dmask" \
     "model.visibility.mode=${mode}" \

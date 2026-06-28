@@ -212,6 +212,16 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-auto}"
 # It enables checkpointing in the mixed video/action MoT attention path.
 MOT_CHECKPOINT_MIXED_ATTN="${MOT_CHECKPOINT_MIXED_ATTN:-true}"
 
+# Keep these false for ACP stability. PyTorch foreach/fused Adam kernels can hit
+# CUDA illegal-memory-access failures in some Torch/DeepSpeed/H100 combinations.
+OPTIMIZER_FOREACH="${OPTIMIZER_FOREACH:-false}"
+OPTIMIZER_FUSED="${OPTIMIZER_FUSED:-false}"
+
+# TODO: DeepSpeed stage for training. Keep 2 by default for memory efficiency.
+# If a run still fails inside DeepSpeed ZeRO2 optimizer internals after disabling
+# foreach/fused Adam, try ZERO_STAGE=1. This uses more memory but a simpler path.
+ZERO_STAGE="${ZERO_STAGE:-2}"
+
 # Optional Hydra overrides. Keep this simple: space-separated key=value entries.
 # TODO: Add project-specific overrides here if needed.
 HYDRA_EXTRA_ARGS="${HYDRA_EXTRA_ARGS:-}"
@@ -338,6 +348,17 @@ resolve_training_batching() {
   RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=$(( RESOLVED_BATCH_SIZE * NPROC_PER_NODE * RESOLVED_GRADIENT_ACCUMULATION_STEPS ))
 }
 
+resolve_train_script() {
+  case "${ZERO_STAGE}" in
+    1) TRAIN_SCRIPT="scripts/train_zero1.sh" ;;
+    2) TRAIN_SCRIPT="scripts/train_zero2.sh" ;;
+    *)
+      echo "ERROR: Unsupported ZERO_STAGE=${ZERO_STAGE}. Expected 1 or 2."
+      return 1
+      ;;
+  esac
+}
+
 validate_lerobot_dir() {
   local dir="$1"
   if [[ ! -d "${dir}" ]]; then
@@ -428,7 +449,7 @@ scan_log_for_errors() {
     return 0
   fi
   grep -qE \
-    "Traceback|RuntimeError|ImportError|ModuleNotFoundError|CUDA out of memory|NCCL error|Error executing job|mujoco.FatalError|gladLoadGL error|Failed to open display" \
+    "Traceback|RuntimeError|ImportError|ModuleNotFoundError|CUDA out of memory|illegal memory access|NCCL error|Error executing job|mujoco.FatalError|gladLoadGL error|Failed to open display" \
     "${LOG_FILE}"
 }
 
@@ -569,12 +590,17 @@ RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=""
 case "${RUN_KIND}" in
   train|ablation)
     resolve_training_batching || exit 2
+    resolve_train_script || exit 2
     echo "========== TRAINING BATCHING =========="
     echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
+    echo "ZERO_STAGE=${ZERO_STAGE}"
+    echo "TRAIN_SCRIPT=${TRAIN_SCRIPT}"
     echo "PER_DEVICE_BATCH_SIZE=${RESOLVED_BATCH_SIZE}"
     echo "GRADIENT_ACCUMULATION_STEPS=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
     echo "EFFECTIVE_GLOBAL_BATCH_SIZE=${RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE}"
     echo "MOT_CHECKPOINT_MIXED_ATTN=${MOT_CHECKPOINT_MIXED_ATTN}"
+    echo "OPTIMIZER_FOREACH=${OPTIMIZER_FOREACH}"
+    echo "OPTIMIZER_FUSED=${OPTIMIZER_FUSED}"
     echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
     ;;
 esac
@@ -605,12 +631,14 @@ case "${RUN_KIND}" in
 
   train)
     CMD=(
-      bash scripts/train_zero2.sh "${NPROC_PER_NODE}"
+      bash "${TRAIN_SCRIPT}" "${NPROC_PER_NODE}"
       "task=${TASK_NAME}"
       "model=${MODEL_CONFIG}"
       "batch_size=${RESOLVED_BATCH_SIZE}"
       "gradient_accumulation_steps=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
+      "optimizer_foreach=${OPTIMIZER_FOREACH}"
+      "optimizer_fused=${OPTIMIZER_FUSED}"
       "wandb.name=${MODEL_CONFIG}_${VISIBILITY_MODE}"
       "${DATA_ARGS[@]}"
     )
@@ -627,12 +655,15 @@ case "${RUN_KIND}" in
     export NPROC_PER_NODE
     export FUTURE_MASK_DROPOUT="${DROPOUT}"
     export RUN_ID_PREFIX="${RUN_ID_PREFIX:-acp_clcf}"
+    export TRAIN_LAUNCH_SCRIPT="${TRAIN_SCRIPT}"
     CMD=(
       bash scripts/run_clcf_ablation.sh
       "task=${TASK_NAME}"
       "batch_size=${RESOLVED_BATCH_SIZE}"
       "gradient_accumulation_steps=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
+      "optimizer_foreach=${OPTIMIZER_FOREACH}"
+      "optimizer_fused=${OPTIMIZER_FUSED}"
       "${DATA_ARGS[@]}"
       "${EXTRA_ARGS[@]}"
     )

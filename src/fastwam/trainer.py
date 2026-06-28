@@ -86,12 +86,26 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
+        optimizer_foreach = bool(cfg.get("optimizer_foreach", False))
+        optimizer_fused = bool(cfg.get("optimizer_fused", False))
+        optimizer_kwargs = self._filter_call_kwargs(
+            torch.optim.AdamW,
+            {
+                "params": trainable_params,
+                "lr": self.learning_rate,
+                "weight_decay": self.weight_decay,
+                "betas": (0.9, 0.95),
+                "foreach": optimizer_foreach,
+                "fused": optimizer_fused,
+            },
         )
+        logger.info(
+            "AdamW optimizer: trainable_params=%d foreach=%s fused=%s",
+            len(trainable_params),
+            optimizer_kwargs.get("foreach", "unsupported"),
+            optimizer_kwargs.get("fused", "unsupported"),
+        )
+        self.optimizer = torch.optim.AdamW(**optimizer_kwargs)
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
