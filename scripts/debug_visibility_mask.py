@@ -28,9 +28,15 @@ def make_base_mask(video_frames: int, h: int, w: int, action_seq_len: int):
     return base, video_seq_len, action_seq_len, video_tokens_per_frame, (video_frames, h, w)
 
 
-def count_future_visible_layers(mask: torch.Tensor, video_seq_len: int, video_tokens_per_frame: int) -> int:
+def count_future_visible_layers(
+    mask: torch.Tensor,
+    video_seq_len: int,
+    video_tokens_per_frame: int,
+    num_layers: int,
+) -> int:
     if mask.ndim == 2:
-        mask = mask.unsqueeze(0)
+        future_visible = bool(mask[video_seq_len:, video_tokens_per_frame:video_seq_len].any().item())
+        return int(num_layers) if future_visible else 0
     future_block = mask[:, video_seq_len:, video_tokens_per_frame:video_seq_len]
     return int(future_block.any(dim=(1, 2)).sum().item())
 
@@ -81,8 +87,8 @@ def main():
         training=False,
     )
 
-    visible_layers = count_future_visible_layers(mask, video_seq_len, tpf)
-    reference_visible_layers = count_future_visible_layers(reference_mask, video_seq_len, tpf)
+    visible_layers = count_future_visible_layers(mask, video_seq_len, tpf, args.num_layers)
+    reference_visible_layers = count_future_visible_layers(reference_mask, video_seq_len, tpf, args.num_layers)
     actual_dropout = (
         args.training
         and args.mode in SCHEDULED_MODES
@@ -91,7 +97,7 @@ def main():
         and visible_layers == 0
     )
 
-    layerwise = mask if mask.ndim == 3 else mask.unsqueeze(0)
+    layerwise = mask if mask.ndim == 3 else mask.unsqueeze(0).expand(args.num_layers, -1, -1)
     p3_layers = [
         layer_idx
         for layer_idx in range(layerwise.shape[0])

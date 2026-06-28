@@ -92,7 +92,69 @@ TASK_NAME="${TASK_NAME:-robotwin_uncond_3cam_384_1e-4}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
-# Training knobs.
+# TODO: Model / visibility knobs for RUN_KIND=train, ablation, debug_mask.
+#
+# MODEL_CONFIG is the Hydra model config name under configs/model/*.yaml.
+# Use the file stem without ".yaml".
+#
+# Recommended for our CLCF-WAM / LayerWAM experiments:
+#   MODEL_CONFIG=fastwam_3dmask
+#     Enables model.visibility.mode and model.visibility.future_mask_dropout.
+#     This is the only MODEL_CONFIG that should be paired with VISIBILITY_MODE.
+#
+# Original Fast-WAM reproduction/debug configs:
+#   MODEL_CONFIG=fastwam
+#     Original Fast-WAM no-future action path. VISIBILITY_MODE is ignored in train.
+#   MODEL_CONFIG=fastwam_joint
+#     Original all-layer joint future-video reference. VISIBILITY_MODE is ignored in train.
+#   MODEL_CONFIG=fastwam_idm
+#     Original IDM variant. VISIBILITY_MODE is ignored in train.
+#
+# RUN_KIND-specific behavior:
+#   precompute_text:
+#     MODEL_CONFIG/VISIBILITY_MODE do not affect the text cache; only TASK_NAME matters.
+#   debug_mask:
+#     MODEL_CONFIG is ignored; VISIBILITY_MODE selects which visibility policy to inspect.
+#   train:
+#     If MODEL_CONFIG=fastwam_3dmask, this script passes:
+#       model=fastwam_3dmask
+#       model.visibility.mode=${VISIBILITY_MODE}
+#       model.visibility.future_mask_dropout=${FUTURE_MASK_DROPOUT or auto-resolved value}
+#     If MODEL_CONFIG is an original Fast-WAM config, this script passes only model=${MODEL_CONFIG}.
+#   ablation:
+#     MODEL_CONFIG/VISIBILITY_MODE are ignored; scripts/run_clcf_ablation.sh always loops over
+#     all first-version visibility modes using model=fastwam_3dmask.
+#
+# VISIBILITY_MODE is valid only for MODEL_CONFIG=fastwam_3dmask or RUN_KIND=debug_mask.
+# Supported VISIBILITY_MODE values:
+#   fastwam
+#     Original no-future direct action-to-video visibility; auto dropout = 0.0.
+#   joint
+#     All layers can directly read all future video tokens; auto dropout = 0.0.
+#   early_matched
+#     P0+P1 all-future dense, P2+P3 closed; 40% visible-layer budget.
+#   sandwich_dense
+#     P1+P2 all-future dense, P0+P3 closed; 40% visible-layer budget.
+#   late_matched
+#     P3 all-future dense, P0+P1+P2 closed; 40% visible-layer budget.
+#   clcf
+#     P1 coarse direct-edge causal sparse, P2 local direct-edge causal dense, P0/P3 closed.
+#   clcf_wo_causal
+#     Removes direct-edge causal constraint while keeping middle-layer and spatial schedule.
+#   clcf_wo_temporal_local
+#     Replaces P2 local window with causal prefix; tests temporal locality.
+#   clcf_wo_spatial_c2f
+#     Makes P1 dense instead of sparse; tests spatial coarse-to-fine.
+#
+# Concrete examples:
+#   Train CLCF:
+#     MODEL_CONFIG=fastwam_3dmask VISIBILITY_MODE=clcf RUN_KIND=train bash scripts/acp_clcf_wam.sh
+#   Train budget-matched sandwich:
+#     MODEL_CONFIG=fastwam_3dmask VISIBILITY_MODE=sandwich_dense RUN_KIND=train bash scripts/acp_clcf_wam.sh
+#   Reproduce original Fast-WAM baseline:
+#     MODEL_CONFIG=fastwam RUN_KIND=train bash scripts/acp_clcf_wam.sh
+#   Inspect CLCF mask only:
+#     RUN_KIND=debug_mask VISIBILITY_MODE=clcf bash scripts/acp_clcf_wam.sh
 MODEL_CONFIG="${MODEL_CONFIG:-fastwam_3dmask}"
 VISIBILITY_MODE="${VISIBILITY_MODE:-clcf}"
 
@@ -328,14 +390,18 @@ case "${RUN_KIND}" in
       bash scripts/train_zero2.sh "${NPROC_PER_NODE}"
       "task=${TASK_NAME}"
       "model=${MODEL_CONFIG}"
-      "model.visibility.mode=${VISIBILITY_MODE}"
-      "model.visibility.future_mask_dropout=${DROPOUT}"
       "batch_size=${BATCH_SIZE}"
       "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
-      "wandb.name=${VISIBILITY_MODE}"
-      "${EXTRA_ARGS[@]}"
+      "wandb.name=${MODEL_CONFIG}_${VISIBILITY_MODE}"
     )
+    if [[ "${MODEL_CONFIG}" == "fastwam_3dmask" ]]; then
+      CMD+=(
+        "model.visibility.mode=${VISIBILITY_MODE}"
+        "model.visibility.future_mask_dropout=${DROPOUT}"
+      )
+    fi
+    CMD+=("${EXTRA_ARGS[@]}")
     ;;
 
   ablation)

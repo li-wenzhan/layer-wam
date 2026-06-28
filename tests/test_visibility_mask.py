@@ -47,6 +47,10 @@ def future_visible_by_layer(mask, video_seq_len, video_tokens_per_frame):
     return mask[:, video_seq_len:, video_tokens_per_frame:video_seq_len].any(dim=(1, 2))
 
 
+def as_layerwise(mask):
+    return mask.unsqueeze(0).expand(30, -1, -1) if mask.ndim == 2 else mask
+
+
 class VisibilityMaskTest(unittest.TestCase):
     def test_latent_level_action_alignment(self):
         aligned, ratio = compute_action_latent_alignment(
@@ -84,6 +88,19 @@ class VisibilityMaskTest(unittest.TestCase):
                 _, video_seq_len, _, tpf, _ = make_base_mask()
                 self.assertEqual(int(future_visible_by_layer(mask, video_seq_len, tpf).sum().item()), 12)
 
+    def test_endpoint_modes_match_original_2d_masks(self):
+        base, video_seq_len, _, _, _ = make_base_mask()
+
+        fastwam_mask = build_mask("fastwam")
+        self.assertEqual(fastwam_mask.ndim, 2)
+        self.assertTrue(torch.equal(fastwam_mask, base))
+
+        joint_expected = base.clone()
+        joint_expected[video_seq_len:, :video_seq_len] = True
+        joint_mask = build_mask("joint")
+        self.assertEqual(joint_mask.ndim, 2)
+        self.assertTrue(torch.equal(joint_mask, joint_expected))
+
     def test_clcf_p3_closes_future_video(self):
         mask = build_mask("clcf")
         _, video_seq_len, _, tpf, _ = make_base_mask()
@@ -109,9 +126,10 @@ class VisibilityMaskTest(unittest.TestCase):
         ):
             with self.subTest(mode=mode):
                 mask = build_mask(mode)
-                self.assertTrue(mask[:, video_seq_len:, :tpf].all().item())
-                self.assertTrue(torch.equal(mask[:, :video_seq_len, :video_seq_len], base[:video_seq_len, :video_seq_len].expand(30, -1, -1)))
-                self.assertFalse(mask[:, :video_seq_len, video_seq_len:video_seq_len + action_seq_len].any().item())
+                layerwise_mask = as_layerwise(mask)
+                self.assertTrue(layerwise_mask[:, video_seq_len:, :tpf].all().item())
+                self.assertTrue(torch.equal(layerwise_mask[:, :video_seq_len, :video_seq_len], base[:video_seq_len, :video_seq_len].expand(30, -1, -1)))
+                self.assertFalse(layerwise_mask[:, :video_seq_len, video_seq_len:video_seq_len + action_seq_len].any().item())
 
     def test_sparse_spatial_rule_uses_2d_grid(self):
         visible = build_spatial_visible(

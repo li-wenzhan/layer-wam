@@ -269,6 +269,13 @@ def build_layerwise_visibility_mask(
             f"video_seq_len={video_seq_len}, video_tokens_per_frame={video_tokens_per_frame}"
         )
 
+    if cfg.mode == "fastwam":
+        return base_mask
+    if cfg.mode == "joint":
+        joint_mask = base_mask.clone()
+        joint_mask[video_seq_len:, :video_seq_len] = True
+        return joint_mask
+
     num_video_latent_frames = video_seq_len // video_tokens_per_frame
     if num_video_latent_frames <= 1:
         return base_mask
