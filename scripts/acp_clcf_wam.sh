@@ -32,6 +32,35 @@ DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-/mnt/afs/task3_2/L202500
 # Example: /mnt/afs/TODO_USER/cache
 CACHE_ROOT="${CACHE_ROOT:-/mnt/afs/task3_2/L202500276_lwz/projects/layer-wam/cache}"
 
+# TODO: Prefer a node-local cache root if ACP provides local SSD/NVMe.
+# HuggingFace datasets uses file locks while reading local parquet. Putting this
+# cache on AFS/NFS can trigger FileNotFoundError during distributed startup.
+# Example: /tmp/TODO_USER/clcf_wam_cache
+LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT:-/tmp/${USER:-clcf_wam}/clcf_wam_cache}"
+
+# TODO: Change to the ACP-visible dataset root. The defaults assume datasets are
+# placed under ${PROJECT_DIR}/data, but cluster datasets are often mounted elsewhere.
+# If you use another mount, set DATA_ROOT or the more specific variables below.
+DATA_ROOT="${DATA_ROOT:-/mnt/afs/task3_2/L202500276_lwz/projects/layer-wam/data}"
+
+# TODO: LIBERO LeRobot dataset directories. Keep this as a comma-separated list
+# without spaces because Hydra receives it as data.train.dataset_dirs=[a,b,c,d].
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-${DATA_ROOT}/libero_mujoco3.3.2}"
+LIBERO_DATASET_DIRS="${LIBERO_DATASET_DIRS:-${LIBERO_DATA_ROOT}/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_10_no_noops_lerobot}"
+
+# TODO: RoboTwin LeRobot dataset directory and normalization stats.
+ROBOTWIN_DATASET_DIR="${ROBOTWIN_DATASET_DIR:-${DATA_ROOT}/robotwin2.0/robotwin2.0}"
+ROBOTWIN_STATS_PATH="${ROBOTWIN_STATS_PATH:-${DATA_ROOT}/robotwin2.0/dataset_stats.json}"
+
+# TODO: Text embedding cache root. precompute_text writes here; train reads here.
+TEXT_EMBED_CACHE_ROOT="${TEXT_EMBED_CACHE_ROOT:-${DATA_ROOT}/text_embeds_cache}"
+
+# Keep true for ACP jobs unless you intentionally want to use paths hardcoded in configs/data/*.yaml.
+APPLY_DATA_OVERRIDES="${APPLY_DATA_OVERRIDES:-true}"
+
+# Split HF datasets cache per local rank to avoid distributed FileLock races.
+CLCF_PER_RANK_DATASETS_CACHE="${CLCF_PER_RANK_DATASETS_CACHE:-true}"
+
 # TODO: Change to a persistent log root. Logs from this script are written below it.
 # Example: /mnt/afs/TODO_USER/tmp/acp_logs
 LOG_ROOT="${LOG_ROOT:-/mnt/afs/task3_2/L202500276_lwz/projects/layer-wam/tmp/acp_logs}"
@@ -44,7 +73,7 @@ LOG_ROOT="${LOG_ROOT:-/mnt/afs/task3_2/L202500276_lwz/projects/layer-wam/tmp/acp
 #   ablation         - run all first-version modes sequentially
 #   eval_libero      - evaluate one checkpoint on LIBERO
 #   eval_robotwin    - evaluate one checkpoint on RoboTwin
-RUN_KIND="${RUN_KIND:-precompute_text}"
+RUN_KIND="${RUN_KIND:-train}"
 
 # TODO: Choose TASK_NAME according to RUN_KIND.
 # Available task configs live in configs/task/*.yaml; pass the file stem without ".yaml".
@@ -86,7 +115,7 @@ RUN_KIND="${RUN_KIND:-precompute_text}"
 #
 # RUN_KIND=debug_mask:
 #   TASK_NAME is only used in the log directory name; visibility behavior is controlled by VISIBILITY_MODE.
-TASK_NAME="${TASK_NAME:-robotwin_uncond_3cam_384_1e-4}"
+TASK_NAME="${TASK_NAME:-libero_uncond_2cam224_1e-4}"
 
 # TODO: Change GPU list according to the ACP resource allocation.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
@@ -156,7 +185,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 #   Inspect CLCF mask only:
 #     RUN_KIND=debug_mask VISIBILITY_MODE=clcf bash scripts/acp_clcf_wam.sh
 MODEL_CONFIG="${MODEL_CONFIG:-fastwam_3dmask}"
-VISIBILITY_MODE="${VISIBILITY_MODE:-clcf}"
+VISIBILITY_MODE="${VISIBILITY_MODE:-fastwam}"
 
 # Use "auto" to follow our convention:
 #   fastwam/joint -> 0.0
@@ -235,6 +264,90 @@ parse_extra_args() {
   fi
 }
 
+task_family() {
+  case "${TASK_NAME}" in
+    libero_*) echo "libero" ;;
+    robotwin_*) echo "robotwin" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+validate_lerobot_dir() {
+  local dir="$1"
+  if [[ ! -d "${dir}" ]]; then
+    echo "ERROR: LeRobot dataset directory does not exist: ${dir}"
+    return 1
+  fi
+  if [[ ! -f "${dir}/meta/tasks.jsonl" ]]; then
+    echo "ERROR: Missing LeRobot tasks file: ${dir}/meta/tasks.jsonl"
+    return 1
+  fi
+  if [[ ! -f "${dir}/meta/info.json" ]]; then
+    echo "ERROR: Missing LeRobot info file: ${dir}/meta/info.json"
+    return 1
+  fi
+  return 0
+}
+
+validate_csv_lerobot_dirs() {
+  local csv="$1"
+  local dirs=()
+  IFS=',' read -r -a dirs <<< "${csv}"
+  if [[ "${#dirs[@]}" -eq 0 ]]; then
+    echo "ERROR: Empty LIBERO_DATASET_DIRS."
+    return 1
+  fi
+  for dir in "${dirs[@]}"; do
+    validate_lerobot_dir "${dir}" || return 1
+  done
+  return 0
+}
+
+build_data_args() {
+  DATA_ARGS=()
+  if [[ "${APPLY_DATA_OVERRIDES}" != "true" ]]; then
+    echo "APPLY_DATA_OVERRIDES=false; using dataset paths from configs/data/*.yaml."
+    return 0
+  fi
+
+  local family
+  family="$(task_family)"
+  case "${family}" in
+    libero)
+      validate_csv_lerobot_dirs "${LIBERO_DATASET_DIRS}" || return 1
+      DATA_ARGS+=(
+        "data.train.dataset_dirs=[${LIBERO_DATASET_DIRS}]"
+        "data.train.text_embedding_cache_dir=${TEXT_EMBED_CACHE_ROOT}/libero"
+      )
+      ;;
+
+    robotwin)
+      validate_lerobot_dir "${ROBOTWIN_DATASET_DIR}" || return 1
+      DATA_ARGS+=(
+        "data.train.dataset_dirs=[${ROBOTWIN_DATASET_DIR}]"
+        "data.train.text_embedding_cache_dir=${TEXT_EMBED_CACHE_ROOT}/robotwin"
+        "data.val.dataset_dirs=[${ROBOTWIN_DATASET_DIR}]"
+        "data.val.text_embedding_cache_dir=${TEXT_EMBED_CACHE_ROOT}/robotwin"
+      )
+      if [[ "${RUN_KIND}" != "precompute_text" && "${ROBOTWIN_STATS_PATH}" != "none" ]]; then
+        if [[ ! -f "${ROBOTWIN_STATS_PATH}" ]]; then
+          echo "ERROR: Missing ROBOTWIN_STATS_PATH: ${ROBOTWIN_STATS_PATH}"
+          echo "Set ROBOTWIN_STATS_PATH=none only if you intentionally want the config to compute/load stats differently."
+          return 1
+        fi
+        DATA_ARGS+=(
+          "data.train.pretrained_norm_stats=${ROBOTWIN_STATS_PATH}"
+          "data.val.pretrained_norm_stats=${ROBOTWIN_STATS_PATH}"
+        )
+      fi
+      ;;
+
+    *)
+      echo "WARNING: Cannot infer dataset family from TASK_NAME=${TASK_NAME}; no data path overrides will be added."
+      ;;
+  esac
+}
+
 run_and_log() {
   echo "========== COMMAND =========="
   printf '%q ' "$@"
@@ -276,6 +389,9 @@ require_no_todo PROJECT_DIR "${PROJECT_DIR}" || exit 2
 require_no_todo CONDA_ENV_DIR "${CONDA_ENV_DIR}" || exit 2
 require_no_todo DIFFSYNTH_MODEL_BASE_PATH "${DIFFSYNTH_MODEL_BASE_PATH}" || exit 2
 require_no_todo CACHE_ROOT "${CACHE_ROOT}" || exit 2
+require_no_todo LOCAL_CACHE_ROOT "${LOCAL_CACHE_ROOT}" || exit 2
+require_no_todo DATA_ROOT "${DATA_ROOT}" || exit 2
+require_no_todo TEXT_EMBED_CACHE_ROOT "${TEXT_EMBED_CACHE_ROOT}" || exit 2
 require_no_todo LOG_ROOT "${LOG_ROOT}" || exit 2
 
 if [[ "${RUN_KIND}" == "eval_libero" || "${RUN_KIND}" == "eval_robotwin" ]]; then
@@ -304,11 +420,15 @@ RUN_STAMP="$(timestamp)"
 RUN_LABEL="${RUN_KIND}_${TASK_NAME}_${VISIBILITY_MODE}_${RUN_STAMP}"
 LOG_DIR="${LOG_ROOT}/${RUN_LABEL}"
 LOG_FILE="${LOG_DIR}/console.log"
+JOB_LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT}/${RUN_LABEL}"
 mkdir -p "${LOG_DIR}"
+mkdir -p "${JOB_LOCAL_CACHE_ROOT}/hf_datasets" "${JOB_LOCAL_CACHE_ROOT}/triton"
 
 echo "PROJECT_DIR=${PROJECT_DIR}"
 echo "CONDA_ENV_DIR=${CONDA_ENV_DIR}"
 echo "LOG_DIR=${LOG_DIR}"
+echo "DATA_ROOT=${DATA_ROOT}"
+echo "JOB_LOCAL_CACHE_ROOT=${JOB_LOCAL_CACHE_ROOT}"
 echo "RUN_KIND=${RUN_KIND}"
 echo "TASK_NAME=${TASK_NAME}"
 echo "VISIBILITY_MODE=${VISIBILITY_MODE}"
@@ -322,9 +442,12 @@ export DIFFSYNTH_MODEL_BASE_PATH
 export HF_HOME="${CACHE_ROOT}/huggingface"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
 export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
-export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export HF_DATASETS_CACHE_BASE="${HF_DATASETS_CACHE_BASE:-${JOB_LOCAL_CACHE_ROOT}/hf_datasets}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE_BASE}"
 export TORCH_HOME="${CACHE_ROOT}/torch"
 export XDG_CACHE_HOME="${CACHE_ROOT}/xdg"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${JOB_LOCAL_CACHE_ROOT}/triton}"
+export CLCF_PER_RANK_DATASETS_CACHE
 
 export HF_DATASETS_OFFLINE="${HF_OFFLINE}"
 export TRANSFORMERS_OFFLINE="${HF_OFFLINE}"
@@ -361,6 +484,17 @@ if [[ "${USE_XVFB}" == "true" ]]; then
 fi
 
 parse_extra_args
+DATA_ARGS=()
+case "${RUN_KIND}" in
+  precompute_text|train|ablation)
+    build_data_args || exit 2
+    ;;
+esac
+
+if [[ "${#DATA_ARGS[@]}" -gt 0 ]]; then
+  echo "========== DATA OVERRIDES =========="
+  printf '%q\n' "${DATA_ARGS[@]}"
+fi
 
 # ==========================================
 # 5. Build command
@@ -372,6 +506,7 @@ case "${RUN_KIND}" in
     CMD=(
       python scripts/precompute_text_embeds.py
       "task=${TASK_NAME}"
+      "${DATA_ARGS[@]}"
       "+overwrite=${OVERWRITE_TEXT_CACHE}"
       "${EXTRA_ARGS[@]}"
     )
@@ -394,6 +529,7 @@ case "${RUN_KIND}" in
       "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
       "wandb.name=${MODEL_CONFIG}_${VISIBILITY_MODE}"
+      "${DATA_ARGS[@]}"
     )
     if [[ "${MODEL_CONFIG}" == "fastwam_3dmask" ]]; then
       CMD+=(
@@ -414,6 +550,7 @@ case "${RUN_KIND}" in
       "batch_size=${BATCH_SIZE}"
       "gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
       "model.mot_checkpoint_mixed_attn=${MOT_CHECKPOINT_MIXED_ATTN}"
+      "${DATA_ARGS[@]}"
       "${EXTRA_ARGS[@]}"
     )
     ;;

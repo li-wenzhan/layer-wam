@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -12,7 +13,26 @@ def bootstrap_repo_src() -> Path:
     src_text = str(src_dir)
     if src_text not in sys.path:
         sys.path.insert(0, src_text)
+    configure_rank_local_datasets_cache()
     return repo_root
+
+
+def configure_rank_local_datasets_cache() -> None:
+    enabled = os.environ.get("CLCF_PER_RANK_DATASETS_CACHE", "").lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return
+
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is None:
+        return
+
+    cache_base = os.environ.get("HF_DATASETS_CACHE_BASE") or os.environ.get("HF_DATASETS_CACHE")
+    if not cache_base:
+        return
+
+    rank_cache = Path(cache_base).expanduser() / f"rank_{local_rank}"
+    rank_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_DATASETS_CACHE"] = str(rank_cache)
 
 
 def assert_huggingface_hub_compatible() -> None:

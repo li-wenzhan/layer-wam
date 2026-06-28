@@ -80,6 +80,31 @@ import traceback
 CODEBASE_VERSION = "v2.1"
 
 
+def _repo_id_looks_like_local_path(repo_id: str | Path) -> bool:
+    repo = str(repo_id)
+    expanded = Path(repo).expanduser()
+    return (
+        expanded.is_absolute()
+        or repo.startswith("./")
+        or repo.startswith("../")
+        or repo.startswith("~/")
+        or repo.startswith("data/")
+        or "\\" in repo
+    )
+
+
+def _local_dataset_load_error(repo_id: str, root: Path, err: Exception) -> FileNotFoundError:
+    return FileNotFoundError(
+        "Local LeRobot dataset could not be loaded. "
+        f"repo_id={repo_id!r}, root={str(root)!r}. "
+        "Because repo_id looks like a local filesystem path, FastWAM will not try "
+        "HuggingFace `snapshot_download`. Check that `data.*.dataset_dirs` points "
+        "to complete ACP-visible LeRobot directories and that HF_DATASETS_CACHE is "
+        "on a filesystem with reliable file locks. "
+        f"Original error: {type(err).__name__}: {err}"
+    )
+
+
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -96,7 +121,9 @@ class LeRobotDatasetMetadata:
             if force_cache_sync:
                 raise FileNotFoundError
             self.load_metadata()
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError) as err:
+            if _repo_id_looks_like_local_path(self.repo_id):
+                raise _local_dataset_load_error(self.repo_id, self.root, err) from err
             # if is_valid_version(self.revision):
             #     self.revision = get_safe_version(self.repo_id, self.revision)
 
@@ -491,7 +518,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 raise FileNotFoundError
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
             self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
+        except (AssertionError, FileNotFoundError, NotADirectoryError) as err:
+            if _repo_id_looks_like_local_path(self.repo_id):
+                raise _local_dataset_load_error(self.repo_id, self.root, err) from err
             # self.revision = get_safe_version(self.repo_id, self.revision)
             self.revision = CODEBASE_VERSION
             self.download_episodes(download_videos)
