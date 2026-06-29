@@ -118,8 +118,8 @@ RUN_KIND="${RUN_KIND:-train}"
 TASK_NAME="${TASK_NAME:-libero_uncond_2cam224_1e-4}"
 
 # TODO: Change GPU list according to the ACP resource allocation.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 
 # TODO: Model / visibility knobs for RUN_KIND=train, ablation, debug_mask.
 #
