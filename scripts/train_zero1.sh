@@ -106,9 +106,11 @@ PY
 fi
 
 echo "[launch] nproc_per_node=${NPROC_PER_NODE} num_machines=${NUM_MACHINES} machine_rank=${MACHINE_RANK} run_id=${RUN_ID}"
+ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE:-scripts/accelerate_configs/accelerate_zero1_ds.yaml}"
+echo "[launch] accelerate_config=${ACCELERATE_CONFIG_FILE}"
 
 accelerate launch \
-  --config_file scripts/accelerate_configs/accelerate_zero1_ds.yaml \
+  --config_file "${ACCELERATE_CONFIG_FILE}" \
   --num_processes "${NPROC_PER_NODE}" \
   scripts/train.py \
   "output_dir=./runs/${TASK_BASENAME}/${RUN_ID}" \

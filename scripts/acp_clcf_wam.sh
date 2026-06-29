@@ -217,9 +217,19 @@ MOT_CHECKPOINT_MIXED_ATTN="${MOT_CHECKPOINT_MIXED_ATTN:-true}"
 OPTIMIZER_FOREACH="${OPTIMIZER_FOREACH:-false}"
 OPTIMIZER_FUSED="${OPTIMIZER_FUSED:-false}"
 
+# TODO: Optimizer state placement.
+# auto:
+#   NPROC_PER_NODE < 4 -> true, uses ZeRO2 CPU optimizer offload to fit 2 * H100.
+#   NPROC_PER_NODE >= 4 -> false, keeps optimizer on GPU for speed.
+# true:
+#   Lower GPU memory, slower optimizer step, more CPU RAM / PCIe traffic.
+# false:
+#   Faster, but 2 * H100 can OOM during Adam step even with micro batch 2.
+OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-auto}"
+
 # TODO: DeepSpeed stage for training. Keep 2 by default for memory efficiency.
-# If a run still fails inside DeepSpeed ZeRO2 optimizer internals after disabling
-# foreach/fused Adam, try ZERO_STAGE=1. This uses more memory but a simpler path.
+# If GPU-only ZeRO2 fails in optimizer step, prefer OPTIMIZER_OFFLOAD=true.
+# ZERO_STAGE=1 is mainly a diagnostic path and usually uses more GPU memory.
 ZERO_STAGE="${ZERO_STAGE:-2}"
 
 # Optional Hydra overrides. Keep this simple: space-separated key=value entries.
@@ -348,10 +358,42 @@ resolve_training_batching() {
   RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=$(( RESOLVED_BATCH_SIZE * NPROC_PER_NODE * RESOLVED_GRADIENT_ACCUMULATION_STEPS ))
 }
 
+resolve_optimizer_offload() {
+  case "${OPTIMIZER_OFFLOAD}" in
+    true|false)
+      RESOLVED_OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD}"
+      ;;
+    auto)
+      if (( NPROC_PER_NODE < 4 )); then
+        RESOLVED_OPTIMIZER_OFFLOAD="true"
+      else
+        RESOLVED_OPTIMIZER_OFFLOAD="false"
+      fi
+      ;;
+    *)
+      echo "ERROR: OPTIMIZER_OFFLOAD must be one of: auto, true, false. Got ${OPTIMIZER_OFFLOAD}"
+      return 1
+      ;;
+  esac
+}
+
 resolve_train_script() {
   case "${ZERO_STAGE}" in
-    1) TRAIN_SCRIPT="scripts/train_zero1.sh" ;;
-    2) TRAIN_SCRIPT="scripts/train_zero2.sh" ;;
+    1)
+      TRAIN_SCRIPT="scripts/train_zero1.sh"
+      ACCELERATE_CONFIG_FILE_RESOLVED="scripts/accelerate_configs/accelerate_zero1_ds.yaml"
+      if [[ "${RESOLVED_OPTIMIZER_OFFLOAD:-false}" == "true" ]]; then
+        echo "WARNING: OPTIMIZER_OFFLOAD=true is only wired for ZERO_STAGE=2; using regular ZeRO1."
+      fi
+      ;;
+    2)
+      TRAIN_SCRIPT="scripts/train_zero2.sh"
+      if [[ "${RESOLVED_OPTIMIZER_OFFLOAD:-false}" == "true" ]]; then
+        ACCELERATE_CONFIG_FILE_RESOLVED="scripts/accelerate_configs/accelerate_zero2_offload_optimizer_ds.yaml"
+      else
+        ACCELERATE_CONFIG_FILE_RESOLVED="scripts/accelerate_configs/accelerate_zero2_ds.yaml"
+      fi
+      ;;
     *)
       echo "ERROR: Unsupported ZERO_STAGE=${ZERO_STAGE}. Expected 1 or 2."
       return 1
@@ -590,17 +632,20 @@ RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE=""
 case "${RUN_KIND}" in
   train|ablation)
     resolve_training_batching || exit 2
+    resolve_optimizer_offload || exit 2
     resolve_train_script || exit 2
     echo "========== TRAINING BATCHING =========="
     echo "NPROC_PER_NODE=${NPROC_PER_NODE}"
     echo "ZERO_STAGE=${ZERO_STAGE}"
     echo "TRAIN_SCRIPT=${TRAIN_SCRIPT}"
+    echo "ACCELERATE_CONFIG_FILE=${ACCELERATE_CONFIG_FILE_RESOLVED}"
     echo "PER_DEVICE_BATCH_SIZE=${RESOLVED_BATCH_SIZE}"
     echo "GRADIENT_ACCUMULATION_STEPS=${RESOLVED_GRADIENT_ACCUMULATION_STEPS}"
     echo "EFFECTIVE_GLOBAL_BATCH_SIZE=${RESOLVED_EFFECTIVE_GLOBAL_BATCH_SIZE}"
     echo "MOT_CHECKPOINT_MIXED_ATTN=${MOT_CHECKPOINT_MIXED_ATTN}"
     echo "OPTIMIZER_FOREACH=${OPTIMIZER_FOREACH}"
     echo "OPTIMIZER_FUSED=${OPTIMIZER_FUSED}"
+    echo "OPTIMIZER_OFFLOAD=${RESOLVED_OPTIMIZER_OFFLOAD}"
     echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
     ;;
 esac
@@ -630,6 +675,7 @@ case "${RUN_KIND}" in
     ;;
 
   train)
+    export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE_RESOLVED}"
     CMD=(
       bash "${TRAIN_SCRIPT}" "${NPROC_PER_NODE}"
       "task=${TASK_NAME}"
@@ -656,6 +702,7 @@ case "${RUN_KIND}" in
     export FUTURE_MASK_DROPOUT="${DROPOUT}"
     export RUN_ID_PREFIX="${RUN_ID_PREFIX:-acp_clcf}"
     export TRAIN_LAUNCH_SCRIPT="${TRAIN_SCRIPT}"
+    export ACCELERATE_CONFIG_FILE="${ACCELERATE_CONFIG_FILE_RESOLVED}"
     CMD=(
       bash scripts/run_clcf_ablation.sh
       "task=${TASK_NAME}"
